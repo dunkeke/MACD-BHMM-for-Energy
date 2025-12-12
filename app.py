@@ -97,10 +97,21 @@ class EnhancedMACD_HMM_Strategy:
                 spread = df['bb_upper'] - df['bb_lower']
                 df['bb_position'] = np.where(spread != 0, (df['close'] - df['bb_lower']) / spread, np.nan)
         
-        # ATR（平均真实波幅）
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        df['atr_ratio'] = df['atr'] / df['close']
-        
+        # ATR（平均真实波幅）- 兼容 pandas-ta 返回 None 或长度不匹配的情况
+        atr_series = None
+        try:
+            atr_candidate = ta.atr(df['high'], df['low'], df['close'], length=14)
+            if atr_candidate is not None and len(atr_candidate) == len(df):
+                atr_series = pd.to_numeric(atr_candidate, errors='coerce')
+                # 确保索引对齐，防止赋值长度错误
+                atr_series = pd.Series(atr_series.values, index=df.index)
+        except Exception:
+            atr_series = None
+
+        if atr_series is not None:
+            df['atr'] = atr_series
+            df['atr_ratio'] = np.where(df['close'] != 0, df['atr'] / df['close'], np.nan)
+
         # 移动平均线
         df['ma_5'] = df['close'].rolling(5).mean()
         df['ma_20'] = df['close'].rolling(20).mean()
