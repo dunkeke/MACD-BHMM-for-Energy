@@ -178,9 +178,9 @@ class EnhancedMACD_HMM_Strategy:
             signal=self.signal_period
         )
 
-        self.data['DIF'] = macd[f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
-        self.data['DEA'] = macd[f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
-        self.data['MACD_hist'] = macd[f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
+        self.data['DIF'] = macd_df[dif_col]
+        self.data['DEA'] = macd_df[dea_col]
+        self.data['MACD_hist'] = macd_df[hist_col]
         
         # 1. 基本交叉信号
         self.data['golden_cross'] = (self.data['DIF'] > self.data['DEA']) & \
