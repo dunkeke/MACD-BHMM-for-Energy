@@ -171,6 +171,16 @@ class EnhancedMACD_HMM_Strategy:
         self.data['DIF'] = _safe_get(dif_col, fallback_prefix='MACD_')
         self.data['DEA'] = _safe_get(dea_col, fallback_prefix='MACDs_')
         self.data['MACD_hist'] = _safe_get(hist_col, fallback_prefix='MACDh_')
+        macd = ta.macd(
+            close_prices,
+            fast=self.fast_period,
+            slow=self.slow_period,
+            signal=self.signal_period
+        )
+
+        self.data['DIF'] = macd[f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
+        self.data['DEA'] = macd[f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
+        self.data['MACD_hist'] = macd[f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
         
         # 1. 基本交叉信号
         self.data['golden_cross'] = (self.data['DIF'] > self.data['DEA']) & \
