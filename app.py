@@ -142,16 +142,52 @@ class EnhancedMACD_HMM_Strategy:
         """计算MACD多形态特征"""
         close_prices = self.data['close'].values
         
-        macd = ta.macd(
-            close_prices,
-            fast=self.fast_period,
-            slow=self.slow_period,
-            signal=self.signal_period
-        )
+        macd_df = None
+        try:
+            macd_candidate = ta.macd(
+                close_prices,
+                fast=self.fast_period,
+                slow=self.slow_period,
+                signal=self.signal_period
+            )
+        except Exception:
+            macd_candidate = None
 
-        self.data['DIF'] = macd[f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
-        self.data['DEA'] = macd[f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
-        self.data['MACD_hist'] = macd[f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
+        dif_col = f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"
+        dea_col = f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"
+        hist_col = f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"
+
+        if isinstance(macd_candidate, pd.DataFrame) and {dif_col, dea_col, hist_col}.issubset(set(macd_candidate.columns)):
+            macd_df = macd_candidate
+
+        if macd_df is None:
+            default_series = pd.Series(0.0, index=self.data.index)
+            default_bool = pd.Series(False, index=self.data.index)
+
+            self.data['DIF'] = default_series
+            self.data['DEA'] = default_series
+            self.data['MACD_hist'] = default_series
+            self.data['golden_cross'] = default_bool
+            self.data['death_cross'] = default_bool
+            self.data['under_water'] = default_bool
+            self.data['underwater_golden'] = default_bool
+            self.data['underwater_death'] = default_bool
+            self.data['double_peak'] = default_bool
+            self.data['double_valley'] = default_bool
+            self.data['macd_momentum'] = default_series
+            self.data['macd_acceleration'] = default_series
+            self.data['hist_trend'] = default_series
+            self.data['price_macd_divergence'] = default_series
+            self.data['macd_strength'] = 0.0
+
+            if hasattr(st, "warning"):
+                st.warning("MACD 无法计算，已使用安全默认值以继续运行。")
+
+            return
+
+        self.data['DIF'] = macd_df[dif_col]
+        self.data['DEA'] = macd_df[dea_col]
+        self.data['MACD_hist'] = macd_df[hist_col]
         
         # 1. 基本交叉信号
         self.data['golden_cross'] = (self.data['DIF'] > self.data['DEA']) & \
