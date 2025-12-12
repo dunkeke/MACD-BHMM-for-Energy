@@ -68,11 +68,12 @@ class EnhancedMACD_HMM_Strategy:
         df['volatility_20'] = df['returns'].rolling(20).std()
         df['volatility_ratio'] = df['volatility_5'] / df['volatility_20']
         
-        # 成交量特征（如果有）
-        if 'volume' in df.columns:
-            df['volume_ma'] = df['volume'].rolling(20).mean()
-            df['volume_ratio'] = df['volume'] / df['volume_ma']
-            df['price_volume_corr'] = df['close'].rolling(10).corr(df['volume'])
+        # 成交量特征（如果有且为数值型）
+        if 'volume' in df.columns and pd.api.types.is_numeric_dtype(df['volume']):
+            volume_series = pd.to_numeric(df['volume'], errors='coerce')
+            df['volume_ma'] = volume_series.rolling(20).mean()
+            df['volume_ratio'] = volume_series / df['volume_ma']
+            df['price_volume_corr'] = df['close'].rolling(10).corr(volume_series)
         
         # RSI指标
         df['rsi'] = ta.rsi(df['close'], length=14)
