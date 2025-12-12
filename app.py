@@ -78,12 +78,24 @@ class EnhancedMACD_HMM_Strategy:
         # RSI指标
         df['rsi'] = ta.rsi(df['close'], length=14)
 
-        # 布林带
-        bbands = ta.bbands(df['close'], length=20, std=2)
-        df['bb_upper'] = bbands['BBU_20_2.0']
-        df['bb_middle'] = bbands['BBM_20_2.0']
-        df['bb_lower'] = bbands['BBL_20_2.0']
-        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        # 布林带（兼容不同版本/列名，且在计算失败时跳过）
+        # pandas-ta 部分环境可能返回 None 或列名变更，异常时直接跳过以避免 Streamlit 崩溃
+        try:
+            bbands = ta.bbands(df['close'], length=20, std=2)
+        except Exception:
+            bbands = None
+
+        if isinstance(bbands, pd.DataFrame):
+            upper_col = next((c for c in bbands.columns if c.startswith('BBU_')), None)
+            middle_col = next((c for c in bbands.columns if c.startswith('BBM_')), None)
+            lower_col = next((c for c in bbands.columns if c.startswith('BBL_')), None)
+
+            if upper_col and middle_col and lower_col:
+                df['bb_upper'] = bbands[upper_col]
+                df['bb_middle'] = bbands[middle_col]
+                df['bb_lower'] = bbands[lower_col]
+                spread = df['bb_upper'] - df['bb_lower']
+                df['bb_position'] = np.where(spread != 0, (df['close'] - df['bb_lower']) / spread, np.nan)
         
         # ATR（平均真实波幅）
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
