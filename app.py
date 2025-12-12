@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
-import talib
+import pandas_ta as ta
 import yfinance as yf
 from scipy.signal import find_peaks
 from hmmlearn import hmm
@@ -75,16 +75,17 @@ class EnhancedMACD_HMM_Strategy:
             df['price_volume_corr'] = df['close'].rolling(10).corr(df['volume'])
         
         # RSI指标
-        df['rsi'] = talib.RSI(df['close'], timeperiod=14)
-        
+        df['rsi'] = ta.rsi(df['close'], length=14)
+
         # 布林带
-        df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(
-            df['close'], timeperiod=20, nbdevup=2, nbdevdn=2
-        )
+        bbands = ta.bbands(df['close'], length=20, std=2)
+        df['bb_upper'] = bbands['BBU_20_2.0']
+        df['bb_middle'] = bbands['BBM_20_2.0']
+        df['bb_lower'] = bbands['BBL_20_2.0']
         df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
         
         # ATR（平均真实波幅）
-        df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         df['atr_ratio'] = df['atr'] / df['close']
         
         # 移动平均线
@@ -117,17 +118,16 @@ class EnhancedMACD_HMM_Strategy:
         """计算MACD多形态特征"""
         close_prices = self.data['close'].values
         
-        # 计算MACD
-        macd, signal, hist = talib.MACD(
-            close_prices, 
-            fastperiod=self.fast_period,
-            slowperiod=self.slow_period,
-            signalperiod=self.signal_period
+        macd = ta.macd(
+            close_prices,
+            fast=self.fast_period,
+            slow=self.slow_period,
+            signal=self.signal_period
         )
-        
-        self.data['DIF'] = macd
-        self.data['DEA'] = signal
-        self.data['MACD_hist'] = hist
+
+        self.data['DIF'] = macd[f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
+        self.data['DEA'] = macd[f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
+        self.data['MACD_hist'] = macd[f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"]
         
         # 1. 基本交叉信号
         self.data['golden_cross'] = (self.data['DIF'] > self.data['DEA']) & \

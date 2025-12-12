@@ -1,7 +1,7 @@
 streamlit>=1.31.0
 numpy>=1.24.0
 pandas>=1.5.0
-talib-binary>=0.4.21
+pandas-ta>=0.3.14b0
 yfinance>=0.2.30
 scipy>=1.10.0
 hmmlearn>=0.2.8
