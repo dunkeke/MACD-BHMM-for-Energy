@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import talib
+import yfinance as yf
 from scipy.signal import find_peaks
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler
@@ -155,6 +156,20 @@ class EnhancedMACD_HMM_Strategy:
         
         # 6. MACD强度指标
         self.data['macd_strength'] = self.calculate_macd_strength()
+
+    def build_macd_event_log(self):
+        """输出MACD事件表，便于调试和回测信号出现的位置"""
+        event_columns = [
+            'golden_cross',
+            'death_cross',
+            'underwater_golden',
+            'underwater_death',
+            'double_peak',
+            'double_valley'
+        ]
+
+        existing_cols = [col for col in event_columns if col in self.data.columns]
+        return self.data[existing_cols].astype(bool)
     
     def detect_double_patterns(self, series, window=10):
         """检测双波峰和双波谷形态"""
@@ -682,6 +697,44 @@ def run_crude_oil_strategy():
     # 绘制结果
     strategy.plot_results()
     
+    return strategy
+
+
+def fetch_yfinance_data(symbol='CL=F', period='2y', interval='4h'):
+    """使用yfinance获取能源品种4小时数据"""
+    raw = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+
+    if raw.empty:
+        raise ValueError(f"无法从yfinance获取{symbol}的数据，请检查代码或网络连接")
+
+    raw = raw.rename(columns={
+        'Open': 'open',
+        'High': 'high',
+        'Low': 'low',
+        'Close': 'close',
+        'Adj Close': 'adj_close',
+        'Volume': 'volume'
+    })
+
+    return raw[['open', 'high', 'low', 'close', 'volume']].dropna()
+
+
+def run_yfinance_energy_strategy(symbol='CL=F', period='2y', interval='4h'):
+    """基于yfinance 4小时数据的能源品种MACD-HMM策略示例"""
+    print(f"从yfinance下载{symbol}的{period}、{interval}数据...")
+    data = fetch_yfinance_data(symbol=symbol, period=period, interval=interval)
+    print(f"获取到{len(data)}根K线，时间范围: {data.index[0]} 至 {data.index[-1]}")
+
+    strategy = EnhancedMACD_HMM_Strategy(
+        data=data,
+        fast_period=12,
+        slow_period=26,
+        signal_period=9,
+        n_hmm_states=5,
+        n_hmm_features=8
+    )
+
+    strategy.generate_report()
     return strategy
 
 
