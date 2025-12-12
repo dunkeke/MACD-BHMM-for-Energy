@@ -142,48 +142,41 @@ class EnhancedMACD_HMM_Strategy:
         """计算MACD多形态特征"""
         close_prices = self.data['close'].values
         
-        macd_df = None
         try:
-            macd_candidate = ta.macd(
+            macd = ta.macd(
                 close_prices,
                 fast=self.fast_period,
                 slow=self.slow_period,
                 signal=self.signal_period
             )
         except Exception:
-            macd_candidate = None
+            macd = None
 
+        # 为非标准/失败输出提供容错，避免缺列引发 KeyError
+        macd_len = len(self.data)
         dif_col = f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"
         dea_col = f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"
         hist_col = f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"
 
-        if isinstance(macd_candidate, pd.DataFrame) and {dif_col, dea_col, hist_col}.issubset(set(macd_candidate.columns)):
-            macd_df = macd_candidate
+        def _safe_get(col_name, fallback_prefix=None):
+            if isinstance(macd, pd.DataFrame) and len(macd) == macd_len:
+                if col_name in macd.columns:
+                    return macd[col_name]
+                if fallback_prefix:
+                    alt = next((c for c in macd.columns if c.startswith(fallback_prefix)), None)
+                    if alt:
+                        return macd[alt]
+            return pd.Series(np.nan, index=self.data.index)
 
-        if macd_df is None:
-            default_series = pd.Series(0.0, index=self.data.index)
-            default_bool = pd.Series(False, index=self.data.index)
-
-            self.data['DIF'] = default_series
-            self.data['DEA'] = default_series
-            self.data['MACD_hist'] = default_series
-            self.data['golden_cross'] = default_bool
-            self.data['death_cross'] = default_bool
-            self.data['under_water'] = default_bool
-            self.data['underwater_golden'] = default_bool
-            self.data['underwater_death'] = default_bool
-            self.data['double_peak'] = default_bool
-            self.data['double_valley'] = default_bool
-            self.data['macd_momentum'] = default_series
-            self.data['macd_acceleration'] = default_series
-            self.data['hist_trend'] = default_series
-            self.data['price_macd_divergence'] = default_series
-            self.data['macd_strength'] = 0.0
-
-            if hasattr(st, "warning"):
-                st.warning("MACD 无法计算，已使用安全默认值以继续运行。")
-
-            return
+        self.data['DIF'] = _safe_get(dif_col, fallback_prefix='MACD_')
+        self.data['DEA'] = _safe_get(dea_col, fallback_prefix='MACDs_')
+        self.data['MACD_hist'] = _safe_get(hist_col, fallback_prefix='MACDh_')
+        macd = ta.macd(
+            close_prices,
+            fast=self.fast_period,
+            slow=self.slow_period,
+            signal=self.signal_period
+        )
 
         self.data['DIF'] = macd_df[dif_col]
         self.data['DEA'] = macd_df[dea_col]
