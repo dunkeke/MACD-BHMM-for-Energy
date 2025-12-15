@@ -142,41 +142,48 @@ class EnhancedMACD_HMM_Strategy:
         """计算MACD多形态特征"""
         close_prices = self.data['close'].values
         
+        macd_df = None
         try:
-            macd = ta.macd(
+            macd_candidate = ta.macd(
                 close_prices,
                 fast=self.fast_period,
                 slow=self.slow_period,
                 signal=self.signal_period
             )
         except Exception:
-            macd = None
+            macd_candidate = None
 
-        # 为非标准/失败输出提供容错，避免缺列引发 KeyError
-        macd_len = len(self.data)
         dif_col = f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"
         dea_col = f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"
         hist_col = f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"
 
-        def _safe_get(col_name, fallback_prefix=None):
-            if isinstance(macd, pd.DataFrame) and len(macd) == macd_len:
-                if col_name in macd.columns:
-                    return macd[col_name]
-                if fallback_prefix:
-                    alt = next((c for c in macd.columns if c.startswith(fallback_prefix)), None)
-                    if alt:
-                        return macd[alt]
-            return pd.Series(np.nan, index=self.data.index)
+        if isinstance(macd_candidate, pd.DataFrame) and {dif_col, dea_col, hist_col}.issubset(set(macd_candidate.columns)):
+            macd_df = macd_candidate
 
-        self.data['DIF'] = _safe_get(dif_col, fallback_prefix='MACD_')
-        self.data['DEA'] = _safe_get(dea_col, fallback_prefix='MACDs_')
-        self.data['MACD_hist'] = _safe_get(hist_col, fallback_prefix='MACDh_')
-        macd = ta.macd(
-            close_prices,
-            fast=self.fast_period,
-            slow=self.slow_period,
-            signal=self.signal_period
-        )
+        if macd_df is None:
+            default_series = pd.Series(0.0, index=self.data.index)
+            default_bool = pd.Series(False, index=self.data.index)
+
+            self.data['DIF'] = default_series
+            self.data['DEA'] = default_series
+            self.data['MACD_hist'] = default_series
+            self.data['golden_cross'] = default_bool
+            self.data['death_cross'] = default_bool
+            self.data['under_water'] = default_bool
+            self.data['underwater_golden'] = default_bool
+            self.data['underwater_death'] = default_bool
+            self.data['double_peak'] = default_bool
+            self.data['double_valley'] = default_bool
+            self.data['macd_momentum'] = default_series
+            self.data['macd_acceleration'] = default_series
+            self.data['hist_trend'] = default_series
+            self.data['price_macd_divergence'] = default_series
+            self.data['macd_strength'] = default_series
+
+            if hasattr(st, "warning"):
+                st.warning("MACD 无法计算，已使用安全默认值以继续运行。")
+
+            return
 
         self.data['DIF'] = macd_df[dif_col]
         self.data['DEA'] = macd_df[dea_col]
@@ -333,11 +340,14 @@ class EnhancedMACD_HMM_Strategy:
         
         # 预测市场状态
         self.data['market_state'] = self.hmm_model.predict(features)
-        
+
         # 计算状态概率
         state_probs = self.hmm_model.predict_proba(features)
         for i in range(self.n_hmm_states):
             self.data[f'state_prob_{i}'] = state_probs[:, i]
+
+        # 保存最可能状态的置信度，作为交易信号的过滤条件
+        self.data['regime_confidence'] = state_probs.max(axis=1)
         
         # 分析各状态特征
         self.analyze_market_states()
@@ -387,8 +397,22 @@ class EnhancedMACD_HMM_Strategy:
                 state_type = "高波动震荡"
             
             state_types[state] = state_type
-        
+
         self.state_types = state_types
+
+        # 将状态映射为方向偏好，用于交易信号强度调整
+        bias_map = {
+            "稳定上涨": 1.0,
+            "波动上涨": 0.6,
+            "横盘整理": 0.0,
+            "稳定下跌": -1.0,
+            "波动下跌": -0.6,
+            "高波动震荡": 0.0
+        }
+
+        self.data['regime_bias'] = self.data['market_state'].map(
+            lambda s: bias_map.get(self.state_types.get(f'State_{s}', ''), 0.0)
+        )
     
     def generate_trading_signals(self):
         """基于HMM状态和MACD信号生成交易信号"""
@@ -401,13 +425,12 @@ class EnhancedMACD_HMM_Strategy:
         
         # 交易参数
         position = 0
-        stop_loss_level = 0.02  # 2%止损
-        take_profit_level = 0.04  # 4%止盈
-        entry_prices = []
-        
+        entry_price = None
+        best_price = None  # 持仓后的最优价格，用于动态止损
+        cooldown = 0  # 平仓后的冷静期，避免连续反复交易
+
         for i in range(1, len(df)):
             current_state = df['market_state'].iloc[i]
-            prev_state = df['market_state'].iloc[i-1]
             
             # MACD信号
             macd_signal = 0
@@ -447,85 +470,98 @@ class EnhancedMACD_HMM_Strategy:
             
             # HMM状态过滤
             state_type = self.state_types.get(f'State_{current_state}', '未知')
-            
-            # 状态过滤规则
+
+            # 状态过滤规则：结合状态偏好和置信度，避免与主要趋势对冲
             state_filter = 1.0
-            if state_type in ["稳定下跌", "波动下跌"]:
-                # 下跌状态中，只考虑强烈的看涨信号
-                if macd_signal < 0:
-                    state_filter = 0.3  # 降低看跌信号权重
-                elif macd_signal >= 2:  # 强烈看涨信号
-                    state_filter = 1.0
-                else:
-                    state_filter = 0.0
-            elif state_type in ["稳定上涨", "波动上涨"]:
-                # 上涨状态中，只考虑强烈的看跌信号
-                if macd_signal > 0:
-                    state_filter = 0.3  # 降低看涨信号权重
-                elif macd_signal <= -2:  # 强烈看跌信号
-                    state_filter = 1.0
-                else:
-                    state_filter = 0.0
-            elif state_type == "横盘整理":
-                # 横盘状态，需要更强的信号
-                if abs(macd_signal) >= 2:
-                    state_filter = 1.0
-                else:
-                    state_filter = 0.0
-            
-            # 综合信号强度
-            final_signal_strength = signal_strength * state_filter * df['macd_strength'].iloc[i]
+            bias = df['regime_bias'].iloc[i]
+            regime_conf = df['regime_confidence'].iloc[i]
+
+            if bias > 0 and macd_signal < 0:
+                state_filter *= 0.25  # 上涨偏好中削弱做空信号
+            if bias < 0 and macd_signal > 0:
+                state_filter *= 0.25  # 下跌偏好中削弱做多信号
+            if state_type == "横盘整理" and abs(macd_signal) < 2:
+                state_filter *= 0.2
+
+            # 综合信号强度：使用HMM置信度、状态偏好和MACD强度共同调节
+            directional_score = macd_signal * state_filter
+            final_signal_strength = (
+                directional_score * (1 + regime_conf) +
+                np.sign(directional_score) * abs(df['macd_strength'].iloc[i])
+            )
             
             # 生成交易信号
+            # 计算动态止损/止盈，以ATR比例为基础（缺失时回退到2%/4%）
+            atr_ratio = float(np.nan_to_num(df.get('atr_ratio', pd.Series(np.nan)).iloc[i], nan=0.02))
+            stop_loss_level = min(max(atr_ratio * 1.5, 0.01), 0.05)
+            take_profit_level = min(max(stop_loss_level * 2, 0.02), 0.12)
+
+            if cooldown > 0:
+                cooldown -= 1
+
             if position == 0:  # 空仓状态
                 # 开多条件
-                if macd_signal >= 1 and final_signal_strength > 0.5:
+                if cooldown == 0 and macd_signal >= 1 and final_signal_strength > 0.5:
                     if state_type not in ["稳定下跌", "波动下跌"]:
                         df.loc[df.index[i], 'signal'] = 1
                         position = 1
-                        entry_prices.append(df['close'].iloc[i])
-                
+                        entry_price = df['close'].iloc[i]
+                        best_price = entry_price
+
                 # 开空条件
-                elif macd_signal <= -1 and final_signal_strength < -0.5:
+                elif cooldown == 0 and macd_signal <= -1 and final_signal_strength < -0.5:
                     if state_type not in ["稳定上涨", "波动上涨"]:
                         df.loc[df.index[i], 'signal'] = -1
                         position = -1
-                        entry_prices.append(df['close'].iloc[i])
-            
+                        entry_price = df['close'].iloc[i]
+                        best_price = entry_price
+
             elif position == 1:  # 持有多头
                 current_price = df['close'].iloc[i]
-                entry_price = entry_prices[-1]
-                
+                best_price = max(best_price, current_price)
+
+                dynamic_stop = max(entry_price * (1 - stop_loss_level), best_price * (1 - stop_loss_level/2))
+
                 # 止损/止盈检查
-                if (current_price <= entry_price * (1 - stop_loss_level)) or \
+                if (current_price <= dynamic_stop) or \
                    (current_price >= entry_price * (1 + take_profit_level)):
                     df.loc[df.index[i], 'signal'] = -1  # 平仓
                     position = 0
-                    entry_prices.pop()
-                
+                    entry_price = None
+                    best_price = None
+                    cooldown = 3
+
                 # MACD反转信号平仓
                 elif macd_signal <= -1 and final_signal_strength < -0.3:
                     df.loc[df.index[i], 'signal'] = -1
                     position = 0
-                    entry_prices.pop()
-            
+                    entry_price = None
+                    best_price = None
+                    cooldown = 2
+
             elif position == -1:  # 持有空头
                 current_price = df['close'].iloc[i]
-                entry_price = entry_prices[-1]
-                
+                best_price = min(best_price, current_price)
+
+                dynamic_stop = min(entry_price * (1 + stop_loss_level), best_price * (1 + stop_loss_level/2))
+
                 # 止损/止盈检查
-                if (current_price >= entry_price * (1 + stop_loss_level)) or \
+                if (current_price >= dynamic_stop) or \
                    (current_price <= entry_price * (1 - take_profit_level)):
                     df.loc[df.index[i], 'signal'] = 1  # 平仓
                     position = 0
-                    entry_prices.pop()
-                
+                    entry_price = None
+                    best_price = None
+                    cooldown = 3
+
                 # MACD反转信号平仓
                 elif macd_signal >= 1 and final_signal_strength > 0.3:
                     df.loc[df.index[i], 'signal'] = 1
                     position = 0
-                    entry_prices.pop()
-            
+                    entry_price = None
+                    best_price = None
+                    cooldown = 2
+
             df.loc[df.index[i], 'position'] = position
             df.loc[df.index[i], 'signal_strength'] = final_signal_strength
         
@@ -545,10 +581,11 @@ class EnhancedMACD_HMM_Strategy:
         strategy_returns = df['cumulative_strategy_returns'].iloc[-1] - 1
         
         # 计算风险指标
-        strategy_volatility = df['strategy_returns'].std() * np.sqrt(252)
-        
-        # 夏普比率
-        sharpe_ratio = df['strategy_returns'].mean() / df['strategy_returns'].std() * np.sqrt(252)
+        strategy_std = df['strategy_returns'].std()
+        strategy_volatility = strategy_std * np.sqrt(252)
+
+        # 夏普比率（若波动率过低则返回0，避免无穷大）
+        sharpe_ratio = (df['strategy_returns'].mean() / strategy_std * np.sqrt(252)) if strategy_std != 0 else 0
         
         # 最大回撤
         cumulative = df['cumulative_strategy_returns']
@@ -583,7 +620,7 @@ class EnhancedMACD_HMM_Strategy:
         """绘制策略结果并返回图表对象，便于在Streamlit中复用"""
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(4, 1, figsize=(15, 12))
+        fig, axes = plt.subplots(5, 1, figsize=(15, 15))
         
         # 1. 价格和持仓
         ax1 = axes[0]
@@ -636,17 +673,37 @@ class EnhancedMACD_HMM_Strategy:
         ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax3.grid(True, alpha=0.3)
         
-        # 4. 累积收益对比
+        # 4. 信号强度与状态置信度
         ax4 = axes[3]
-        ax4.plot(self.data.index, self.data['cumulative_returns'], 
-                label='Buy & Hold', color='gray', linewidth=1)
-        ax4.plot(self.data.index, self.data['cumulative_strategy_returns'], 
-                label='MACD-HMM Strategy', color='blue', linewidth=2)
-        ax4.set_title('Cumulative Returns Comparison', fontsize=12)
-        ax4.set_xlabel('Date')
-        ax4.set_ylabel('Cumulative Returns')
-        ax4.legend()
+        ax4.plot(self.data.index, self.data['signal_strength'], label='Signal Strength', color='#34495e')
+        if 'regime_confidence' in self.data.columns:
+            ax4.plot(self.data.index, self.data['regime_confidence'], label='Regime Confidence', color='#16a085')
+        if 'regime_bias' in self.data.columns:
+            ax4.fill_between(
+                self.data.index,
+                0,
+                self.data['regime_bias'],
+                color='#95a5a6',
+                alpha=0.3,
+                label='Regime Bias'
+            )
+        ax4.axhline(0, color='black', linewidth=0.5, linestyle='--')
+        ax4.set_title('Signal Strength & Regime Filters', fontsize=12)
+        ax4.set_ylabel('Strength / Bias')
+        ax4.legend(loc='upper right')
         ax4.grid(True, alpha=0.3)
+
+        # 5. 累积收益对比
+        ax5 = axes[4]
+        ax5.plot(self.data.index, self.data['cumulative_returns'],
+                label='Buy & Hold', color='gray', linewidth=1)
+        ax5.plot(self.data.index, self.data['cumulative_strategy_returns'],
+                label='MACD-HMM Strategy', color='blue', linewidth=2)
+        ax5.set_title('Cumulative Returns Comparison', fontsize=12)
+        ax5.set_xlabel('Date')
+        ax5.set_ylabel('Cumulative Returns')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
         
         plt.tight_layout()
 
