@@ -6,8 +6,266 @@ import yfinance as yf
 from scipy.signal import find_peaks
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
+
+
+class BHMM_MACD_BiDirectional:
+    """
+    简化版的双向 MACD + HMM 策略，专注于
+    - 水下双波谷 + 金叉：做多
+    - 水上双波峰 + 死叉：做空
+
+    主要用于在 Streamlit 页面中快速回测与可视化双峰/双谷信号。
+    """
+
+    def __init__(self, symbol, start_date='2023-01-01', interval='1h', initial_capital=100000):
+        self.symbol = symbol
+        self.start_date = start_date
+        self.interval = interval
+        self.initial_capital = initial_capital
+
+        # MACD 参数
+        self.fast = 12
+        self.slow = 26
+        self.signal = 9
+
+        # HMM 参数
+        self.n_hmm_states = 3
+
+        self.data = None
+        self.trades = []
+        self.equity_curve = []
+
+    def fetch_data(self):
+        """获取 yfinance 数据并转换为 4H 周期。"""
+        from datetime import datetime, timedelta
+
+        # 1h 数据限制处理
+        if self.interval == '1h':
+            limit_date = datetime.now() - timedelta(days=720)
+            start_arg = limit_date.strftime('%Y-%m-%d') if pd.to_datetime(self.start_date) < limit_date else self.start_date
+        else:
+            start_arg = self.start_date
+
+        try:
+            df = yf.download(self.symbol, start=start_arg, interval=self.interval, progress=False, auto_adjust=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            # 重采样到 4H (构建波段结构)
+            if self.interval == '1h':
+                df_4h = df.resample('4h').agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+                }).dropna()
+                self.data = df_4h
+            else:
+                self.data = df
+
+            if len(self.data) < 100:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def calculate_model(self):
+        """计算 MACD 与 HMM 状态。"""
+        df = self.data.copy()
+
+        # 1. MACD
+        df['EMA12'] = df['Close'].ewm(span=self.fast, adjust=False).mean()
+        df['EMA26'] = df['Close'].ewm(span=self.slow, adjust=False).mean()
+        df['DIF'] = df['EMA12'] - df['EMA26']
+        df['DEA'] = df['DIF'].ewm(span=self.signal, adjust=False).mean()
+        df['MACD_Hist'] = 2 * (df['DIF'] - df['DEA'])
+
+        # 2. HMM 特征 (收益率, 波动率, 动能)
+        df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+        df['Range'] = (df['High'] - df['Low']) / df['Close']
+        df.dropna(inplace=True)
+
+        X = np.column_stack([df['Log_Ret'].values, df['MACD_Hist'].values, df['Range'].values])
+
+        # 训练 HMM
+        model = hmm.GaussianHMM(n_components=self.n_hmm_states, covariance_type="full", n_iter=100, random_state=42)
+        model.fit(X)
+        hidden_states = model.predict(X)
+
+        # 状态排序: 0=空头(Bear), 1=震荡(Chop), 2=多头(Bull)
+        state_means = [df['Log_Ret'][hidden_states == i].mean() for i in range(self.n_hmm_states)]
+        sorted_map = {old: new for new, old in enumerate(np.argsort(state_means))}
+        df['Regime'] = [sorted_map[s] for s in hidden_states]
+
+        self.data = df
+
+    def generate_signals(self):
+        """生成双向信号: 水下双谷买入 / 水上双峰卖出"""
+        df = self.data
+        df['Signal'] = 0  # 1=Buy, -1=Sell
+        df['Structure'] = ''  # 记录形态类型
+
+        dif_vals = df['DIF'].values
+
+        troughs_idx = find_peaks(-dif_vals, distance=3)[0]
+        peaks_idx = find_peaks(dif_vals, distance=3)[0]
+
+        is_trough = pd.Series(False, index=df.index)
+        is_peak = pd.Series(False, index=df.index)
+        is_trough.iloc[troughs_idx] = True
+        is_peak.iloc[peaks_idx] = True
+
+        troughs_buffer = []
+        peaks_buffer = []
+
+        for i in range(1, len(df)):
+            curr_dif = df['DIF'].iloc[i]
+            prev_dif = df['DIF'].iloc[i-1]
+            curr_dea = df['DEA'].iloc[i]
+            prev_dea = df['DEA'].iloc[i-1]
+            regime = df['Regime'].iloc[i]  # 0=Bear, 1=Chop, 2=多头
+
+            # --- 维护波谷 (水下) ---
+            if curr_dif > 0:
+                troughs_buffer = []  # 出水，波谷结构失效
+            elif is_trough.iloc[i]:
+                troughs_buffer.append(curr_dif)
+
+            # --- 维护波峰 (水上) ---
+            if curr_dif < 0:
+                peaks_buffer = []  # 入水，波峰结构失效
+            elif is_peak.iloc[i]:
+                peaks_buffer.append(curr_dif)
+
+            # --- 交易逻辑 ---
+            golden_cross = (curr_dif > curr_dea) and (prev_dif <= prev_dea)
+            if golden_cross and curr_dif < 0:
+                if len(troughs_buffer) >= 2 and regime > 0:
+                    df.at[df.index[i], 'Signal'] = 1
+                    df.at[df.index[i], 'Structure'] = 'W-Bottom'
+
+            dead_cross = (curr_dif < curr_dea) and (prev_dif >= prev_dea)
+            if dead_cross and curr_dif > 0:
+                if len(peaks_buffer) >= 2 and regime < 2:
+                    df.at[df.index[i], 'Signal'] = -1
+                    df.at[df.index[i], 'Structure'] = 'M-Top'
+
+        self.data = df
+
+    def run_backtest(self):
+        """执行多空回测"""
+        df = self.data
+        if 'Signal' not in df.columns:
+            return {'Return': 0, 'MaxDD': 0, 'Trades': 0}
+
+        capital = self.initial_capital
+        position = 0.0
+        entry_price = 0.0
+
+        equity_curve = []
+        trades = []
+
+        for i in range(len(df)):
+            price = df['Close'].iloc[i]
+            signal = df['Signal'].iloc[i]
+            date = df.index[i]
+
+            if signal == 1:
+                if position < 0:
+                    pnl = (entry_price - price) * abs(position)
+                    capital += pnl
+                    trades.append({'Date': date, 'Type': 'Close Short', 'Price': price, 'PnL': pnl})
+                    position = 0
+
+                if position == 0:
+                    position = capital / price
+                    entry_price = price
+                    trades.append({'Date': date, 'Type': 'Open Long', 'Price': price, 'PnL': 0})
+
+            elif signal == -1:
+                if position > 0:
+                    pnl = (price - entry_price) * abs(position)
+                    capital += pnl
+                    trades.append({'Date': date, 'Type': 'Close Long', 'Price': price, 'PnL': pnl})
+                    position = 0
+
+                if position == 0:
+                    position = -(capital / price)
+                    entry_price = price
+                    trades.append({'Date': date, 'Type': 'Open Short', 'Price': price, 'PnL': 0})
+
+            if position != 0:
+                floating_pnl = (price - entry_price) * position
+                curr_eq = capital + floating_pnl
+            else:
+                curr_eq = capital
+
+            equity_curve.append(curr_eq)
+
+        self.equity_curve = equity_curve
+        self.trades = pd.DataFrame(trades)
+
+        if not equity_curve:
+            return {'Return': 0, 'MaxDD': 0, 'Trades': 0}
+
+        total_ret = (equity_curve[-1] - self.initial_capital) / self.initial_capital
+
+        s = pd.Series(equity_curve)
+        cummax = s.cummax()
+        drawdown = (s - cummax) / cummax
+        max_dd = drawdown.min()
+
+        return {'Return': total_ret, 'MaxDD': max_dd, 'Trades': len(trades)}
+
+    def plot(self, show=True):
+        """可视化价格、状态与双峰/双谷信号。"""
+        df = self.data
+        if df is None:
+            return None
+
+        fig = plt.figure(figsize=(12, 9))
+        gs = fig.add_gridspec(3, 1, height_ratios=[2, 0.5, 1], hspace=0.2)
+
+        ax1 = fig.add_subplot(gs[0])
+        ax1.plot(df.index, df['Close'], color='black', alpha=0.6, label='Price')
+        y1, y2 = df['Close'].min(), df['Close'].max()
+        ax1.fill_between(df.index, y1, y2, where=df['Regime'] == 0, color='red', alpha=0.1, label='Bear')
+        ax1.fill_between(df.index, y1, y2, where=df['Regime'] == 2, color='green', alpha=0.1, label='Bull')
+
+        buys = df[df['Signal'] == 1]
+        sells = df[df['Signal'] == -1]
+        ax1.scatter(buys.index, buys['Close'], marker='^', color='purple', s=80, zorder=5, label='W-Bot Buy')
+        ax1.scatter(sells.index, sells['Close'], marker='v', color='orange', s=80, zorder=5, label='M-Top Sell')
+        ax1.set_title(f'{self.symbol} - BHMM & Double Peak/Valley Strategy', fontsize=14)
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        ax2.plot(df.index, self.equity_curve, color='#2980b9', label='Equity')
+        ax2.set_ylabel('Capital')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper left')
+
+        ax3 = fig.add_subplot(gs[2], sharex=ax1)
+        ax3.plot(df.index, df['DIF'], color='#2980b9', label='DIF')
+        ax3.plot(df.index, df['DEA'], color='#e67e22', label='DEA')
+        ax3.axhline(0, color='black', linestyle='--', linewidth=0.8)
+
+        dif_vals = df['DIF'].values
+        troughs = find_peaks(-dif_vals, distance=3)[0]
+        peaks = find_peaks(dif_vals, distance=3)[0]
+        valid_troughs = [i for i in troughs if df['DIF'].iloc[i] < 0]
+        valid_peaks = [i for i in peaks if df['DIF'].iloc[i] > 0]
+
+        ax3.scatter(df.index[valid_troughs], df['DIF'].iloc[valid_troughs], color='green', s=20, label='Valley')
+        ax3.scatter(df.index[valid_peaks], df['DIF'].iloc[valid_peaks], color='red', s=20, label='Peak')
+        ax3.legend(loc='upper left')
+        ax3.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if show:
+            plt.show()
+        return fig
 
 class EnhancedMACD_HMM_Strategy:
     """
@@ -142,52 +400,35 @@ class EnhancedMACD_HMM_Strategy:
         """计算MACD多形态特征"""
         close_prices = self.data['close'].values
         
-        macd_df = None
         try:
-            macd_candidate = ta.macd(
+            macd = ta.macd(
                 close_prices,
                 fast=self.fast_period,
                 slow=self.slow_period,
                 signal=self.signal_period
             )
         except Exception:
-            macd_candidate = None
+            macd = None
 
+        # 为非标准/失败输出提供容错，避免缺列引发 KeyError
+        macd_len = len(self.data)
         dif_col = f"MACD_{self.fast_period}_{self.slow_period}_{self.signal_period}"
         dea_col = f"MACDs_{self.fast_period}_{self.slow_period}_{self.signal_period}"
         hist_col = f"MACDh_{self.fast_period}_{self.slow_period}_{self.signal_period}"
 
-        if isinstance(macd_candidate, pd.DataFrame) and {dif_col, dea_col, hist_col}.issubset(set(macd_candidate.columns)):
-            macd_df = macd_candidate
+        def _safe_get(col_name, fallback_prefix=None):
+            if isinstance(macd, pd.DataFrame) and len(macd) == macd_len:
+                if col_name in macd.columns:
+                    return macd[col_name]
+                if fallback_prefix:
+                    alt = next((c for c in macd.columns if c.startswith(fallback_prefix)), None)
+                    if alt:
+                        return macd[alt]
+            return pd.Series(np.nan, index=self.data.index)
 
-        if macd_df is None:
-            default_series = pd.Series(0.0, index=self.data.index)
-            default_bool = pd.Series(False, index=self.data.index)
-
-            self.data['DIF'] = default_series
-            self.data['DEA'] = default_series
-            self.data['MACD_hist'] = default_series
-            self.data['golden_cross'] = default_bool
-            self.data['death_cross'] = default_bool
-            self.data['under_water'] = default_bool
-            self.data['underwater_golden'] = default_bool
-            self.data['underwater_death'] = default_bool
-            self.data['double_peak'] = default_bool
-            self.data['double_valley'] = default_bool
-            self.data['macd_momentum'] = default_series
-            self.data['macd_acceleration'] = default_series
-            self.data['hist_trend'] = default_series
-            self.data['price_macd_divergence'] = default_series
-            self.data['macd_strength'] = default_series
-
-            if hasattr(st, "warning"):
-                st.warning("MACD 无法计算，已使用安全默认值以继续运行。")
-
-            return
-
-        self.data['DIF'] = macd_df[dif_col]
-        self.data['DEA'] = macd_df[dea_col]
-        self.data['MACD_hist'] = macd_df[hist_col]
+        self.data['DIF'] = _safe_get(dif_col, fallback_prefix='MACD_')
+        self.data['DEA'] = _safe_get(dea_col, fallback_prefix='MACDs_')
+        self.data['MACD_hist'] = _safe_get(hist_col, fallback_prefix='MACDh_')
         
         # 1. 基本交叉信号
         self.data['golden_cross'] = (self.data['DIF'] > self.data['DEA']) & \
@@ -620,7 +861,7 @@ class EnhancedMACD_HMM_Strategy:
         """绘制策略结果并返回图表对象，便于在Streamlit中复用"""
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(5, 1, figsize=(15, 15))
+        fig, axes = plt.subplots(4, 1, figsize=(15, 12))
         
         # 1. 价格和持仓
         ax1 = axes[0]
@@ -859,6 +1100,20 @@ def cached_fetch_yfinance_data(symbol: str, period: str, interval: str):
     return fetch_yfinance_data(symbol=symbol, period=period, interval=interval)
 
 
+def run_bidirectional_backtest(symbol: str, start_date: str, interval: str, initial_capital: int = 100000):
+    """运行基于双峰/双谷的回测，返回绩效与图表。"""
+    strat = BHMM_MACD_BiDirectional(symbol, start_date=start_date, interval=interval, initial_capital=initial_capital)
+    if not strat.fetch_data():
+        raise ValueError("数据下载失败或样本量不足，无法运行回测")
+
+    strat.calculate_model()
+    strat.generate_signals()
+    metrics = strat.run_backtest()
+    fig = strat.plot(show=False)
+    plt.close(fig)
+    return metrics, fig
+
+
 def render_streamlit_app():
     """简易的Streamlit界面，方便在Web端运行策略"""
     st.set_page_config(page_title="MACD-HMM能源策略", layout="wide")
@@ -920,6 +1175,38 @@ def render_streamlit_app():
     st.subheader("图表")
     fig = strategy.plot_results(show=False)
     st.pyplot(fig, use_container_width=True)
+
+    st.subheader("双波峰/双波谷信号回测（HMM过滤）")
+    with st.expander("运行双峰/双谷回测并查看信号可视化", expanded=False):
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            start_date = st.text_input("起始日期", value="2023-06-01")
+        with col_b:
+            raw_interval = st.selectbox("下载K线周期", options=["1h", "4h", "1d"], index=0,
+                                        help="选择1h将自动聚合到4H进行波段识别")
+        with col_c:
+            init_capital = st.number_input("初始资金", min_value=10000, max_value=500000, value=100000, step=10000)
+
+        run_backtest = st.button("生成双峰/双谷回测图表", key="double_pattern")
+
+        if run_backtest:
+            with st.spinner("正在计算双峰/双谷信号与回测..."):
+                try:
+                    metrics, bidir_fig = run_bidirectional_backtest(
+                        symbol=symbol,
+                        start_date=start_date,
+                        interval=raw_interval,
+                        initial_capital=init_capital,
+                    )
+                except Exception as exc:  # pragma: no cover - 交互提示
+                    st.error(f"回测失败: {exc}")
+                else:
+                    met_cols = st.columns(3)
+                    met_cols[0].metric("累计收益", f"{metrics['Return']*100:.2f}%")
+                    met_cols[1].metric("最大回撤", f"{metrics['MaxDD']*100:.2f}%")
+                    met_cols[2].metric("交易次数", int(metrics['Trades']))
+
+                    st.pyplot(bidir_fig, use_container_width=True)
 
 
 # 运行策略
