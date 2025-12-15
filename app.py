@@ -500,27 +500,49 @@ class EnhancedMACD_HMM_Strategy:
         return double_peak, double_valley
     
     def detect_divergence(self, price, indicator, window=20):
-        """检测价格与指标的背离"""
-        divergence = np.zeros(len(price))
-        
+        """检测价格与指标的背离，兼容可能返回二维/空数据的情况"""
+
+        def _to_numeric_1d(arr_like):
+            arr = np.asarray(arr_like)
+            if arr.ndim > 1:
+                arr = arr[:, 0]
+            arr = np.ravel(arr)
+            return pd.to_numeric(arr, errors='coerce')
+
+        price_arr = _to_numeric_1d(price)
+        ind_arr = _to_numeric_1d(indicator)
+
+        length = min(len(price_arr), len(ind_arr))
+        if length == 0:
+            return np.array([])
+
+        price_arr = price_arr[:length]
+        ind_arr = ind_arr[:length]
+
+        # 替换 NaN 以避免 find_peaks 抛错
+        price_arr = np.nan_to_num(price_arr)
+        ind_arr = np.nan_to_num(ind_arr)
+
+        divergence = np.zeros(length)
+
         # 寻找价格和指标的局部极值
-        price_peaks, _ = find_peaks(price, distance=window//2)
-        price_valleys, _ = find_peaks(-price, distance=window//2)
-        ind_peaks, _ = find_peaks(indicator, distance=window//2)
-        ind_valleys, _ = find_peaks(-indicator, distance=window//2)
-        
+        price_peaks, _ = find_peaks(price_arr, distance=max(1, window//2))
+        price_valleys, _ = find_peaks(-price_arr, distance=max(1, window//2))
+        ind_peaks, _ = find_peaks(ind_arr, distance=max(1, window//2))
+        ind_valleys, _ = find_peaks(-ind_arr, distance=max(1, window//2))
+
         # 顶背离：价格新高，指标新低
         if len(price_peaks) > 1 and len(ind_peaks) > 1:
-            if price[price_peaks[-1]] > price[price_peaks[-2]] and \
-               indicator[ind_peaks[-1]] < indicator[ind_peaks[-2]]:
+            if price_arr[price_peaks[-1]] > price_arr[price_peaks[-2]] and \
+               ind_arr[ind_peaks[-1]] < ind_arr[ind_peaks[-2]]:
                 divergence[price_peaks[-1]] = -1  # 看跌信号
-        
+
         # 底背离：价格新低，指标新高
         if len(price_valleys) > 1 and len(ind_valleys) > 1:
-            if price[price_valleys[-1]] < price[price_valleys[-2]] and \
-               indicator[ind_valleys[-1]] > indicator[ind_valleys[-2]]:
+            if price_arr[price_valleys[-1]] < price_arr[price_valleys[-2]] and \
+               ind_arr[ind_valleys[-1]] > ind_arr[ind_valleys[-2]]:
                 divergence[price_valleys[-1]] = 1  # 看涨信号
-        
+
         return divergence
     
     def calculate_macd_strength(self):
